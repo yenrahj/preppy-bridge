@@ -19,7 +19,7 @@ const SEQUENCE_MAP = {
 
 // Apollo list ID for the "inbox_from_rebecca" search outbox.
 // Grab from URL: https://app.apollo.io/#/contacts?finderViewId=...&listId=<LIST_ID>
-const APOLLO_INBOX_LIST_ID = 'REPLACE_WITH_APOLLO_LIST_ID';
+const APOLLO_INBOX_LIST_ID = '69d65c6b00b0d30015c0eafa';
 
 // Default email mailbox ID for sequence enrollment (Rebecca's mailbox).
 // Find via Apollo API GET /v1/email_accounts or grab from a sequence enrollment URL.
