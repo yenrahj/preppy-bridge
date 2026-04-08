@@ -1,0 +1,16 @@
+{
+  "name": "preppy-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Webhook bridge between Attio (source of truth) and Apollo (sequence execution). All Rebecca workflows live in Attio; Apollo runs headless.",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}

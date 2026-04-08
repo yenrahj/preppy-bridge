@@ -1,0 +1,13 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/dead-mans-switch",
+      "schedule": "0 13 * * *"
+    }
+  ],
+  "functions": {
+    "api/**/*.js": {
+      "maxDuration": 60
+    }
+  }
+}
