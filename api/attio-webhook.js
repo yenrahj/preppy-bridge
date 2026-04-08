@@ -3,23 +3,23 @@
 //
 // Single endpoint handling ALL Attio workflow payloads:
 //
-//   1. "Person added to Sequence: Automated Sequence" â Vercel
-//   2. "Person added to Sequence: Preppy â Dept Heads â Referral Engine"
-//   3. "Person added to Sequence: Preppy â Education Director â Rural"
-//   4. "Person added to Sequence: Preppy â CNO â Rural Staffing"
+//   1. "Person added to Sequence: Automated Sequence" Ã¢ÂÂ Vercel
+//   2. "Person added to Sequence: Preppy Ã¢ÂÂ Dept Heads Ã¢ÂÂ Referral Engine"
+//   3. "Person added to Sequence: Preppy Ã¢ÂÂ Education Director Ã¢ÂÂ Rural"
+//   4. "Person added to Sequence: Preppy Ã¢ÂÂ CNO Ã¢ÂÂ Rural Staffing"
 //   5. "Person added to Sequence: High-Touch Sequence"
-//   6. "Outreach Stage changed â Vercel"
-//   7. "Apollo Search Outbox entry created â Vercel"
-//   8. "[ARCHIVED] Person removed from Sequence list" â disabled, ignored
+//   6. "Outreach Stage changed Ã¢ÂÂ Vercel"
+//   7. "Apollo Search Outbox entry created Ã¢ÂÂ Vercel"
+//   8. "[ARCHIVED] Person removed from Sequence list" Ã¢ÂÂ disabled, ignored
 //
 // Routing strategy: each Attio workflow's "Send HTTP request" action posts
 // the trigger payload as-is. We sniff the shape to figure out which event
 // it is. To make this rock-solid, you can also configure each Attio
 // workflow to add a query string like ?event=sequence_added&list=automated
-// to the webhook URL â in which case we use that hint instead.
+// to the webhook URL Ã¢ÂÂ in which case we use that hint instead.
 //
 // PAYLOAD SHAPES (approximate; verify against actual Attio webhook output
-// during Phase 3 testing â print req.body and adjust the parsers below):
+// during Phase 3 testing Ã¢ÂÂ print req.body and adjust the parsers below):
 //
 // "Record added to list" payloads include the list name and the parent
 // person record. "Attribute updated" payloads include old/new values and
@@ -80,7 +80,7 @@ module.exports = async (req, res) => {
 };
 
 // --------------------------------------------------------------------
-// Event detection â fallback when no ?event= hint is provided
+// Event detection Ã¢ÂÂ fallback when no ?event= hint is provided
 // --------------------------------------------------------------------
 
 function detectEvent(body) {
@@ -111,15 +111,17 @@ function detectEvent(body) {
 function extractPerson(body) {
   // Flat payload from Attio workflow "Send HTTP request" body templates
   if (body.email) {
+    // Attio variable pills inject leading/trailing whitespace; trim all values.
+    const t = (v) => (typeof v === 'string' ? v.trim() : v);
     return {
-      id: body.record_id || null,
-      email: body.email,
-      firstName: body.first_name || null,
-      lastName: body.last_name || null,
-      fullName: [body.first_name, body.last_name].filter(Boolean).join(' ') || null,
-      title: body.job_title || null,
-      company: body.company || null,
-      linkedinUrl: body.linkedin_url || null,
+      id: t(body.record_id) || null,
+      email: t(body.email),
+      firstName: t(body.first_name) || null,
+      lastName: t(body.last_name) || null,
+      fullName: [t(body.first_name), t(body.last_name)].filter(Boolean).join(' ') || null,
+      title: t(body.job_title) || null,
+      company: t(body.company) || null,
+      linkedinUrl: t(body.linkedin_url) || null,
     };
   }
 
@@ -226,9 +228,9 @@ async function handleStageChanged(body) {
 
   if (!newStage) throw new Error('stage_changed: could not determine new stage');
 
-  console.log(`[stage_changed] ${person.email} â ${newStage}`);
+  console.log(`[stage_changed] ${person.email} Ã¢ÂÂ ${newStage}`);
 
-  // Find the Apollo contact ID â prefer the one stored on the Attio record
+  // Find the Apollo contact ID Ã¢ÂÂ prefer the one stored on the Attio record
   const apolloContactId = await getApolloContactIdForPerson(person);
 
   switch (newStage) {
@@ -255,7 +257,7 @@ async function handleStageChanged(body) {
       return { action: 'paused_sequence', apolloContactId };
     }
     case 'Escalated': {
-      // Just flag â the "Needs Human Touch" view filters on this stage,
+      // Just flag Ã¢ÂÂ the "Needs Human Touch" view filters on this stage,
       // so Rebecca will see them. No Apollo action needed beyond that.
       return { action: 'noted', apolloContactId };
     }
@@ -285,7 +287,7 @@ async function handleOutboxAdded(body) {
   // Optional: clear them from the inbox_from_rebecca list now that they're
   // in Attio. This keeps the outbox empty as designed.
   // Skipped here because the outbox-added flow originates in Attio, not
-  // Apollo. The reverse direction (Apollo outbox â Attio creation) belongs
+  // Apollo. The reverse direction (Apollo outbox Ã¢ÂÂ Attio creation) belongs
   // in a separate scheduled poller if you decide to support it.
 
   return { apolloContactId, created };
