@@ -252,7 +252,7 @@ function extractContext(body) {
     firstName: contact?.first_name,
     lastName: contact?.last_name,
     title: contact?.title,
-    company: contact?.organization_name || contact?.account_name,
+    company: contact?.organization_name || contact?.account_name || contact?.company,
     sequenceId: body?.emailer_campaign_id || body?.sequence_id || null,
     replyBody:
       body?.reply_body ||
