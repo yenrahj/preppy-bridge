@@ -1,30 +1,56 @@
 # preppy-bridge
 
-Webhook bridge between **Attio** (source of truth, where Rebecca lives) and **Apollo** (headless sequence execution + contact search). Plain Node serverless functions on Vercel. No Next.js, no framework.
+Webhook bridge between **Attio** (where Rebecca lives) and **Apollo** (headless sequence execution). Plain Node serverless functions on Vercel.
 
 ## Architecture
 
 ```
-        ┌──────────────────────────────────┐
-        │  ATTIO — Rebecca's only UI       │
-        │  • Needs Human Touch view         │
-        │  • Records, notes, stage changes  │
-        └───────────┬──────────────────────┘
-                    │ 8 webhooks
+Cold outbound (Jack owns):
+  Flywheel → Apollo sequences
+  Jack enrolls directly in Apollo
+                    │
                     ▼
-        ┌───────────────────────────────────┐
-        │  preppy-bridge (this project)     │
-        │  /api/attio-webhook               │
-        │  /api/apollo-webhook              │
-        │  /api/cron/dead-mans-switch       │
-        └───────────┬───────────────────────┘
-                    │ 5 webhooks
-                    ▲
-        ┌──────────────────────────────────┐
-        │  APOLLO — headless                │
-        │  • Sequences run silently         │
-        │  • Contact search DB only         │
-        └──────────────────────────────────┘
+  Engagement events (opens/clicks/replies/bounces/meetings)
+                    │
+                    ▼
+       Apollo workflow webhooks → bridge → Attio
+                                            │
+                        Engagement threshold logic:
+                        - Click → Flagged for Review = true
+                        - 3 opens / 7 days → Flagged for Review = true
+                        - Reply → Outreach Stage = Engaged + note posted
+                        - Meeting → Outreach Stage = Meeting Booked
+                        - Bounce → Outreach Stage = Do Not Contact
+                                            │
+                                            ▼
+                        ┌─────────────────────────────────┐
+                        │  Attio: Needs Human Touch view  │
+                        │  Rebecca works leads from here  │
+                        └──────────────┬──────────────────┘
+                                       │
+                          Lead goes cold after Rebecca
+                          has been working it manually
+                                       │
+                                       ▼
+                        ┌─────────────────────────────────┐
+                        │  Attio "Drip Re-engagement"     │
+                        │  list — Rebecca drops them here │
+                        └──────────────┬──────────────────┘
+                                       │
+                                   bridge
+                                       │
+                                       ▼
+                        ┌─────────────────────────────────┐
+                        │  Apollo "Bridge Drip" list      │
+                        └──────────────┬──────────────────┘
+                                       │
+                              Apollo workflow
+                                       │
+                                       ▼
+                        ┌─────────────────────────────────┐
+                        │  Apollo drip sequence (slow,    │
+                        │  low-touch periodic nudges)     │
+                        └─────────────────────────────────┘
 ```
 
 ## File map
@@ -32,128 +58,114 @@ Webhook bridge between **Attio** (source of truth, where Rebecca lives) and **Ap
 ```
 preppy-bridge/
 ├── api/
-│   ├── attio-webhook.js        # all 8 Attio workflow payloads
-│   ├── apollo-webhook.js       # all 5 Apollo workflow payloads
-│   ├── health.js               # GET for sanity check
+│   ├── attio-webhook.js        # drip_added, stage_changed, outbox_added
+│   ├── apollo-webhook.js       # replied/opened/clicked/bounced/finished/meeting
+│   ├── health.js
 │   └── cron/
-│       └── dead-mans-switch.js # daily consistency check
+│       └── dead-mans-switch.js # daily drip path consistency check
 ├── lib/
-│   ├── attio.js                # Attio REST API helpers
-│   ├── apollo.js               # Apollo REST API helpers
-│   ├── http.js                 # fetch wrapper with retries
-│   ├── respond.js              # res.send(JSON.stringify(...)) pattern
-│   ├── dedupe.js               # open-event dedupe
-│   └── notify.js               # Slack alerts
-├── config.js                   # ⚠️ FILL IN sequence IDs before deploying
-├── vercel.json                 # cron config
+│   ├── attio.js
+│   ├── apollo.js
+│   ├── http.js
+│   ├── respond.js
+│   ├── dedupe.js
+│   └── notify.js
+├── config.js                   # ⚠️ fill in APOLLO_DRIP_LIST_ID
+├── vercel.json
 ├── package.json
-├── .env.example                # copy to .env.local
+├── .env.example
 └── README.md
 ```
 
 ## Pre-deploy checklist
 
 **1. Fill in `config.js`:**
-- Replace each `REPLACE_WITH_APOLLO_SEQUENCE_ID` with the real Apollo sequence ID. Grab from the URL when viewing each sequence in Apollo: `https://app.apollo.io/#/sequences/<ID>/overview`
-- Replace `APOLLO_INBOX_LIST_ID` with the `inbox_from_rebecca` Apollo list ID (recorded in Phase 2.5)
-- Replace `APOLLO_DEFAULT_MAILBOX_ID` with Rebecca's mailbox ID. Get it via `curl -H "X-Api-Key: $APOLLO_API_KEY" https://api.apollo.io/v1/email_accounts`
-- Replace `APOLLO_REBECCA_USER_ID` with Rebecca's Apollo user ID. Get it via `curl -X POST -H "X-Api-Key: $APOLLO_API_KEY" -H "Content-Type: application/json" -d '{"q_keywords":"Rebecca"}' https://api.apollo.io/v1/users/search`
+Only one value needs to change from what's already there: `APOLLO_DRIP_LIST_ID`. The Chrome agent brief walks you through creating the Apollo list and grabbing the ID.
 
-**2. Set up env vars locally:**
-```bash
-cp .env.example .env.local
-# Then edit .env.local with the real values
-```
-You need:
-- `ATTIO_API_KEY` — the `vercel-bridge` token from Attio (created in Phase 1.6)
-- `APOLLO_API_KEY` — the `preppy_flywheel` API key
-- `WEBHOOK_SHARED_SECRET` — generate any random string: `openssl rand -hex 32`
-- `SLACK_ALERT_WEBHOOK_URL` — optional but strongly recommended
+**2. Schema update in Attio:**
+Before deploying, add two new attributes to the People object. The Chrome agent brief covers this.
 
-**3. Install + local test:**
-```bash
-npm install
-npx vercel dev
-# In another terminal:
-curl http://localhost:3000/api/health
-# Should return {"ok":true,"service":"preppy-bridge",...}
-```
-
-## Deploy
-
-```bash
-npx vercel link        # link to a new Vercel project
-npx vercel env add ATTIO_API_KEY production
-npx vercel env add APOLLO_API_KEY production
-npx vercel env add WEBHOOK_SHARED_SECRET production
-npx vercel env add SLACK_ALERT_WEBHOOK_URL production   # optional
-npx vercel --prod
-```
-
-After deploy, your endpoints will be:
-- `https://preppy-bridge-xxxx.vercel.app/api/health`
-- `https://preppy-bridge-xxxx.vercel.app/api/attio-webhook`
-- `https://preppy-bridge-xxxx.vercel.app/api/apollo-webhook`
-
-## Webhook URLs to paste into Attio and Apollo
-
-For Attio, add a `?event=` hint to each URL so the bridge knows what to do without sniffing the payload. The 7 active Attio workflows (the removal one stays archived) become:
-
-| Attio workflow | Webhook URL |
+| Attribute | Type |
 |---|---|
-| Person added to Sequence: Automated Sequence | `.../api/attio-webhook?event=sequence_added&secret=...` |
-| Person added to Dept Heads Referral list | `.../api/attio-webhook?event=sequence_added&secret=...` |
-| Person added to Education Director Rural list | `.../api/attio-webhook?event=sequence_added&secret=...` |
-| Person added to CNO Rural Staffing list | `.../api/attio-webhook?event=sequence_added&secret=...` |
-| Person added to High-Touch Sequence list | `.../api/attio-webhook?event=sequence_added&secret=...` |
-| Outreach Stage changed | `.../api/attio-webhook?event=stage_changed&secret=...` |
-| Apollo Search Outbox entry created | `.../api/attio-webhook?event=outbox_added&secret=...` |
+| Open Count 7d | Number |
+| Opens Reset At | Timestamp |
 
-(All 5 sequence workflows hit the same endpoint with the same hint — the bridge reads the list name from the payload to pick the right Apollo sequence ID.)
+Without these attributes, the open-threshold logic will silently no-op because the writes will be rejected.
 
-For Apollo, the 5 webhook workflows:
+**3. Env vars (already set from v1):**
+- `ATTIO_API_KEY`
+- `APOLLO_API_KEY` (use the `preppy_flywheel` key, NOT Attio Connect)
+- `WEBHOOK_SHARED_SECRET`
+- `SLACK_ALERT_WEBHOOK_URL` (optional)
 
-| Apollo workflow | Webhook URL |
+## Engagement threshold logic
+
+Configurable in `config.js`:
+
+```js
+const ENGAGEMENT_OPEN_THRESHOLD      = 3;    // opens before flag
+const ENGAGEMENT_OPEN_WINDOW_DAYS    = 7;    // rolling window
+const OPEN_EVENT_DEDUPE_WINDOW_MINUTES = 60; // rapid-fire noise filter
+```
+
+**Open counter:** stored on the Attio record itself in `open_count_7d` and `opens_reset_at`. Every open event: dedupe first (60 min), then read counter, check if window is expired (if so, reset to 1), else increment. At `>= threshold`, set `flagged_for_review = true`.
+
+**Clicks** bypass the counter and flag immediately.
+
+**Flagged contacts stay in their cold sequence.** Apollo's native auto-remove-on-reply handles the cutoff when they actually engage back.
+
+## Events handled
+
+### Apollo → Attio (writeback)
+
+| Event | Effect in Attio |
 |---|---|
-| Email Replied | `.../api/apollo-webhook?event=replied&secret=...` |
-| Email Opened | `.../api/apollo-webhook?event=opened&secret=...` |
-| Email Bounced | `.../api/apollo-webhook?event=bounced&secret=...` |
-| Contact Finished Sequence | `.../api/apollo-webhook?event=finished&secret=...` |
-| Meeting Booked | `.../api/apollo-webhook?event=meeting&secret=...` |
+| `replied` | `Outreach Stage = Engaged`, note created with reply body |
+| `opened` | `Last Engagement Date` + counter increment, flag if threshold hit |
+| `clicked` | `Last Engagement Type = Clicked`, `Flagged for Review = true` |
+| `bounced` | `Outreach Stage = Do Not Contact` |
+| `finished` | `Apollo Sequence Status = Finished` (no stage change) |
+| `meeting` | `Outreach Stage = Meeting Booked` |
 
-## Testing order (Phase 3 from main brief)
+### Attio → Apollo
 
-Enable **one workflow at a time** and verify each before moving to the next:
+| Event | Effect |
+|---|---|
+| `drip_added` | Upsert contact in Apollo, add to Bridge Drip list, Apollo workflow enrolls in drip sequence |
+| `stage_changed` | DNC pauses sequence status in Attio (no Apollo call — gated endpoint) |
+| `outbox_added` | Upsert contact in Apollo for enrichment |
 
-1. **Apollo Search Outbox** — add a dummy contact to the outbox list, verify it lands in Apollo's contact DB.
-2. **Outreach Stage changed → Do Not Contact** — change a test person's stage, verify Apollo removes them from any active sequences.
-3. **Apollo Email Opened** — wait for or simulate an open, verify `Last Engagement Date` updates in Attio (and that opens DON'T cause appearance in Needs Human Touch).
-4. **Apollo Email Replied** — verify Outreach Stage flips to Engaged, a note gets posted with the reply body, and they appear in Needs Human Touch.
-5. **Person added to a Sequence list** — add a test person, verify Apollo enrolls them.
-6. **The escalation workflow** (Automated → High-Touch on Engagement) — verify the cascade fires correctly through the bridge.
+**Cold sequence enrollment is NOT handled by the bridge.** Jack runs cold outbound directly in Apollo via the Flywheel.
 
-## Known things to verify after first real payload
+## Webhook URLs
 
-The payload extractors in `api/attio-webhook.js` (`extractPerson`, `extractListName`, `extractCurrentStage`) and `api/apollo-webhook.js` (`extractContext`) are **defensive but speculative** — they handle multiple plausible shapes because we haven't seen the actual webhook bodies yet.
+Existing URLs from v1 stay the same. One new Apollo webhook needs to be added:
 
-During Phase 3 testing:
-1. Tail logs with `npx vercel logs --follow` (or check the Vercel dashboard)
-2. The first line of every handler logs the event + a 500-char body slice
-3. If a handler fails or extracts wrong values, copy the logged payload and adjust the extractor
+```
+https://preppy-bridge.vercel.app/api/apollo-webhook?event=clicked&secret=<SECRET>
+```
 
-This is a 5-minute fix per handler once you see the real shape.
+## Known gating
+
+These Apollo endpoints are plan-gated on the current plan and the bridge does NOT call them:
+
+- `/v1/emailer_campaigns/add_contact_ids`
+- `/v1/emailer_campaigns/remove_contact_ids`
+- `/v1/emailer_campaigns/{id}/add_contact_ids`
+
+Instead: `PUT /v1/contacts/{id}` with `add_label_ids` / `remove_label_ids` is used for list membership, which an Apollo workflow translates into sequence enrollment.
 
 ## Operational notes
 
-- **Open events are deduped** — at most one per contact per 24 hours (configurable in `config.js`). Current dedupe is in-memory per warm Lambda; swap to Vercel KV if it gets noisy.
-- **Open events do NOT change Outreach Stage** — they only update last-engagement fields. Otherwise Rebecca's queue would fill with image-preloader noise.
-- **Replied/Bounced/Meeting events all redundantly call Apollo's remove-from-sequence** even though Apollo's native auto-remove should handle it. Belt and suspenders. Disable via `ENABLE_REDUNDANT_APOLLO_REMOVAL` in `config.js` if it causes 422s.
-- **The dead-man's-switch runs daily at 8am CT (13:00 UTC)**. It finds Attio people who should not be in any sequence but are, alerts via Slack, and auto-heals if `DEAD_MANS_SWITCH_AUTO_HEAL` is true.
-- **No polling fallback** — the bridge is event-driven only. If Apollo workflows stop firing for any reason, the dead-man's-switch is your safety net.
+- **Open events are deduped** at 60 minutes by default (shorter than v1's 24h because we need real counts for the threshold logic, not just "ever opened")
+- **Opens do NOT change `Outreach Stage`** — they only update counter + last engagement + flag
+- **Flagged stays sticky** — once `Flagged for Review = true`, the bridge doesn't unflag. Rebecca unflags manually when she's done with the lead.
+- **Dead-man's-switch** runs daily, narrowed to just the drip path (finds Attio Drip entries missing Apollo Contact ID)
+- **No auto-heal** — the dead-man's-switch alerts only because the heal path would hit gated endpoints
 
 ## When something breaks
 
 1. Check Vercel logs first
-2. Check Slack for alerts (if `SLACK_ALERT_WEBHOOK_URL` is set)
-3. Hit `/api/health` to verify env vars are still set
-4. Most likely culprit: payload shape changed, extractors need updating
+2. Check Slack for alerts
+3. Hit `/api/health` to verify env vars
+4. Most likely culprit: Attio payload shape changed — extractors may need updating

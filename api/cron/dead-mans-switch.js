@@ -1,88 +1,86 @@
 // ====================================================================
 // api/cron/dead-mans-switch.js
 //
-// Daily consistency check. Runs at 13:00 UTC (8am CT) per vercel.json.
+// Daily consistency check for the drip re-engagement path. Runs at
+// 13:00 UTC (8am CT) per vercel.json.
 //
-// Finds Attio People whose Outreach Stage indicates they should NOT be
-// in any active Apollo sequence, but who actually still are. This catches
-// sync failures, race conditions, and any case where the bridge silently
-// dropped an event.
+// In the simplified architecture, Attio does NOT manage cold sequence
+// membership — Jack handles that directly in Apollo. The only cross-
+// system state the bridge owns is the drip re-engagement path:
 //
-// "Should not be in a sequence" stages:
-//   - Engaged
-//   - Meeting Booked
-//   - Do Not Contact
-//   - Escalated
+//   Attio "Drip" list → bridge → Apollo "Bridge Drip" list → Apollo
+//   workflow → drip sequence
 //
-// On finding a discrepancy:
-//   1. Always log + Slack alert
-//   2. If DEAD_MANS_SWITCH_AUTO_HEAL is true, also remove from Apollo
+// This cron catches inconsistencies in that path:
+//
+//   1. People in the Attio Drip list whose Attio record does NOT have
+//      an Apollo Contact ID yet (drip_added handler probably failed)
+//
+//   2. Optional future check: people whose apollo_sequence_status is
+//      "Active" and assignedSequence is "Drip Re-engagement" but who
+//      aren't actually in the Apollo Bridge Drip list.
+//
+// On finding issues, logs + Slack alerts. Does NOT auto-heal because
+// the underlying endpoints are plan-gated on our current Apollo plan.
 // ====================================================================
 
 const { ok, fail } = require('../../lib/respond');
 const attio = require('../../lib/attio');
-const apollo = require('../../lib/apollo');
 const { alert } = require('../../lib/notify');
-const { DEAD_MANS_SWITCH_AUTO_HEAL } = require('../../config');
-
-const SHOULD_NOT_BE_SEQUENCED = ['Engaged', 'Meeting Booked', 'Do Not Contact', 'Escalated'];
 
 module.exports = async (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
 
-  // Vercel cron sends a header for verification (when configured).
-  // For now, accept any caller — tighten with WEBHOOK_SHARED_SECRET if needed.
-
   try {
     const startedAt = Date.now();
-    const people = await attio.findPeopleByStage(SHOULD_NOT_BE_SEQUENCED);
-    console.log(`[dead-mans-switch] checking ${people.length} people`);
+    const issues = [];
 
-    const discrepancies = [];
-    let healed = 0;
+    // Find people in the Attio "Drip" list. We'll look up the list by
+    // name and then page through its entries. If the Drip list doesn't
+    // exist yet, this will return null and we just exit cleanly.
+    const dripListId = await attio.findListIdByName('Drip Re-engagement');
+    if (!dripListId) {
+      console.log('[dead-mans-switch] no Drip Re-engagement list found, skipping');
+      return ok(res, { skipped: 'no_drip_list' });
+    }
 
-    for (const person of people) {
-      const personId = person?.id?.record_id;
-      const apolloContactId = person?.values?.apollo_contact_id?.[0]?.value;
-      const stage = person?.values?.outreach_stage?.[0]?.option?.title;
-      const email = person?.values?.email_addresses?.[0]?.email_address;
-      if (!apolloContactId) continue;
-
-      let activeIds = [];
+    // Get everyone in the Drip list and verify each has an Apollo
+    // Contact ID set on their record. Missing ID = drip_added webhook
+    // failed to write back.
+    const entries = await attio.getListEntries(dripListId, 200);
+    let missingApolloId = 0;
+    for (const entry of entries) {
+      const personId = entry?.parent_record_id || entry?.record_id;
+      if (!personId) continue;
       try {
-        activeIds = await apollo.getActiveSequenceIds(apolloContactId);
-      } catch (err) {
-        console.warn(`[dead-mans-switch] apollo lookup failed for ${apolloContactId}`, err.message);
-        continue;
-      }
-      if (activeIds.length === 0) continue;
-
-      discrepancies.push({ personId, email, stage, apolloContactId, activeIds });
-
-      if (DEAD_MANS_SWITCH_AUTO_HEAL) {
-        try {
-          await apollo.removeContactFromAllSequences(apolloContactId);
-          await attio.setEngagement(personId, { apolloSequenceStatus: 'Not In Sequence' });
-          healed++;
-        } catch (err) {
-          console.error(`[dead-mans-switch] heal failed for ${apolloContactId}`, err.message);
+        const person = await attio.getPersonById(personId);
+        const apolloId = person?.values?.apollo_contact_id?.[0]?.value;
+        if (!apolloId) {
+          missingApolloId++;
+          issues.push({
+            personId,
+            email: person?.values?.email_addresses?.[0]?.email_address,
+            reason: 'in_drip_list_but_no_apollo_contact_id',
+          });
         }
+      } catch (err) {
+        console.warn('[dead-mans-switch] lookup failed', personId, err.message);
       }
     }
 
     const took = Date.now() - startedAt;
     const summary = {
-      checked: people.length,
-      discrepancies: discrepancies.length,
-      healed,
+      checkedDripEntries: entries.length,
+      issues: issues.length,
+      missingApolloId,
       durationMs: took,
     };
     console.log('[dead-mans-switch]', summary);
 
-    if (discrepancies.length > 0) {
+    if (issues.length > 0) {
       await alert(
-        `Dead-man's-switch found ${discrepancies.length} sync discrepancies (healed ${healed})`,
-        { sample: discrepancies.slice(0, 10) }
+        `Dead-man's-switch found ${issues.length} drip path issue(s)`,
+        { sample: issues.slice(0, 10) }
       );
     }
 

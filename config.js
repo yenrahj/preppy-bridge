@@ -1,62 +1,80 @@
 // ====================================================================
 // config.js — bridge configuration
 //
-// FILL IN the Apollo sequence IDs before deploying. You can grab each
-// sequence ID from the URL when viewing the sequence in Apollo:
-//    https://app.apollo.io/#/sequences/<SEQUENCE_ID>/overview
+// ARCHITECTURE (final):
 //
-// The KEY on the left is the EXACT name of the Attio list (without the
-// "Sequence: " prefix). The VALUE on the right is the Apollo sequence ID.
+// - Jack runs all cold outbound directly in Apollo (via Flywheel).
+//   The bridge does NOT enroll contacts in cold sequences.
+//
+// - Apollo engagement events (opens/clicks/replies/bounces/meetings)
+//   flow into Attio as writeback. The bridge tracks opens on a rolling
+//   7-day window; once a contact hits ENGAGEMENT_OPEN_THRESHOLD opens,
+//   it sets Flagged for Review = true so Rebecca sees them in her
+//   "Needs Human Touch" view. Clicks flag immediately.
+//
+// - The ONLY Attio-originated Apollo path is the drip re-engagement
+//   list: Rebecca drops a gone-cold lead in the Attio "Drip" list,
+//   the bridge mirrors to Apollo's "Bridge Drip" list, and an Apollo
+//   workflow picks it up and enrolls in a drip sequence.
 // ====================================================================
 
-const SEQUENCE_MAP = {
-    'Automated Sequence':                  '69a5f9c5175aaa0011a52b6d',
-    'Preppy – Dept Heads – Referral Engine': '69d40c29e16fa90011eec03a',
-    'Preppy – Education Director – Rural':   '69d408c9160b4a00215cabef',
-    'Preppy – CNO – Rural Staffing':         '69d4052e6344f40019af033c',
-    'High-Touch Sequence':                   '69c6abc9b1641e0011c514d7',
-};
+// Apollo list ID for the Bridge Drip re-engagement list.
+// Fill in after creating the Apollo list (see Chrome agent brief).
+const APOLLO_DRIP_LIST_ID = 'REPLACE_WITH_APOLLO_DRIP_LIST_ID';
 
-// Apollo list ID for the "inbox_from_rebecca" search outbox.
-// Grab from URL: https://app.apollo.io/#/contacts?finderViewId=...&listId=<LIST_ID>
+// Apollo list ID for the "Bridge Inbox" search outbox (existing).
 const APOLLO_INBOX_LIST_ID = '69d65c6b00b0d30015c0eafa';
 
-// Default email mailbox ID for sequence enrollment (Rebecca's mailbox).
-// Find via Apollo API GET /v1/email_accounts or grab from a sequence enrollment URL.
+// Retained for reference — no longer used by the bridge directly. Apollo
+// sequence enrollment is handled by Jack in Apollo's UI.
+const APOLLO_SEQUENCE_IDS_REFERENCE = {
+  'Automated Sequence':                    '69a5f9c5175aaa0011a52b6d',
+  'Preppy – Dept Heads – Referral Engine': '69d40c29e16fa90011eec03a',
+  'Preppy – Education Director – Rural':   '69d408c9160b4a00215cabef',
+  'Preppy – CNO – Rural Staffing':         '69d4052e6344f40019af033c',
+  'High-Touch Sequence':                   '69c6abc9b1641e0011c514d7',
+};
+
+// Rebecca's mailbox and user IDs — retained for reference.
 const APOLLO_DEFAULT_MAILBOX_ID = '6998baa2e1a5e90011234290';
-
-// Apollo user ID for Rebecca (used as send_email_from_email_account_id fallback
-// and as the assignee for any tasks the bridge creates). Find via Apollo API
-// GET /v1/users/search.
-const APOLLO_REBECCA_USER_ID = '69a0649787ea9b00217d9cb9';
+const APOLLO_REBECCA_USER_ID    = '69a0649787ea9b00217d9cb9';
 
 // ====================================================================
-// Behavior knobs — sane defaults, tweak if needed
+// Engagement threshold settings
 // ====================================================================
 
-// Open events are noisy (40%+ open rate × hundreds of contacts). The bridge
-// only writes an "Opened" engagement to Attio at most once per contact per
-// this many minutes. Replies, bounces, meetings, and finishes always write.
-const OPEN_EVENT_DEDUPE_WINDOW_MINUTES = 1440; // 24 hours
+// How many opens within the rolling window before a contact gets flagged.
+const ENGAGEMENT_OPEN_THRESHOLD = 3;
 
-// When a contact is removed from a sequence due to reply/meeting/DNC, the
-// bridge calls Apollo's remove-from-sequence endpoint. Set false to rely
-// solely on Apollo's native "auto-remove on reply" setting (belt only,
-// no suspenders).
-const ENABLE_REDUNDANT_APOLLO_REMOVAL = true;
+// Rolling window in days for the open counter. If a contact hasn't hit
+// the threshold within this window, the counter resets on the next open.
+const ENGAGEMENT_OPEN_WINDOW_DAYS = 7;
 
-// Dead-man's-switch tolerance: if the cron finds a contact whose Attio
-// Outreach Stage is "Engaged" or "Do Not Contact" but who is still active
-// in an Apollo sequence, alert immediately. Set true to also auto-remove
-// them from Apollo as a self-healing measure.
-const DEAD_MANS_SWITCH_AUTO_HEAL = true;
+// Noise dedupe: the SAME open event may fire multiple times from image
+// preloaders. This window prevents rapid-fire duplicates from being
+// double-counted. Set shorter than a normal user revisit gap.
+const OPEN_EVENT_DEDUPE_WINDOW_MINUTES = 60;
+
+// ====================================================================
+// Behavior knobs
+// ====================================================================
+
+// Direct API removal hits the plan-gated endpoint. Rely on Apollo's
+// native "auto-remove on reply" instead.
+const ENABLE_REDUNDANT_APOLLO_REMOVAL = false;
+
+// Dead-man's-switch auto-heal: same gating issue. Alert only.
+const DEAD_MANS_SWITCH_AUTO_HEAL = false;
 
 module.exports = {
-    SEQUENCE_MAP,
-    APOLLO_INBOX_LIST_ID,
-    APOLLO_DEFAULT_MAILBOX_ID,
-    APOLLO_REBECCA_USER_ID,
-    OPEN_EVENT_DEDUPE_WINDOW_MINUTES,
-    ENABLE_REDUNDANT_APOLLO_REMOVAL,
-    DEAD_MANS_SWITCH_AUTO_HEAL,
+  APOLLO_DRIP_LIST_ID,
+  APOLLO_INBOX_LIST_ID,
+  APOLLO_SEQUENCE_IDS_REFERENCE,
+  APOLLO_DEFAULT_MAILBOX_ID,
+  APOLLO_REBECCA_USER_ID,
+  ENGAGEMENT_OPEN_THRESHOLD,
+  ENGAGEMENT_OPEN_WINDOW_DAYS,
+  OPEN_EVENT_DEDUPE_WINDOW_MINUTES,
+  ENABLE_REDUNDANT_APOLLO_REMOVAL,
+  DEAD_MANS_SWITCH_AUTO_HEAL,
 };

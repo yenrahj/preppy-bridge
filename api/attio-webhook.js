@@ -1,29 +1,27 @@
 // ====================================================================
 // api/attio-webhook.js
 //
-// Single endpoint handling ALL Attio workflow payloads:
+// Handles Attio workflow webhook payloads for the simplified
+// architecture. The bridge supports three events:
 //
-//   1. "Person added to Sequence: Automated Sequence" Ã¢ÂÂ Vercel
-//   2. "Person added to Sequence: Preppy Ã¢ÂÂ Dept Heads Ã¢ÂÂ Referral Engine"
-//   3. "Person added to Sequence: Preppy Ã¢ÂÂ Education Director Ã¢ÂÂ Rural"
-//   4. "Person added to Sequence: Preppy Ã¢ÂÂ CNO Ã¢ÂÂ Rural Staffing"
-//   5. "Person added to Sequence: High-Touch Sequence"
-//   6. "Outreach Stage changed Ã¢ÂÂ Vercel"
-//   7. "Apollo Search Outbox entry created Ã¢ÂÂ Vercel"
-//   8. "[ARCHIVED] Person removed from Sequence list" Ã¢ÂÂ disabled, ignored
+//   - drip_added:    Person added to Attio "Drip" list.
+//                    Bridge mirrors them to the Apollo Bridge Drip list,
+//                    where an Apollo workflow enrolls in a drip sequence.
 //
-// Routing strategy: each Attio workflow's "Send HTTP request" action posts
-// the trigger payload as-is. We sniff the shape to figure out which event
-// it is. To make this rock-solid, you can also configure each Attio
-// workflow to add a query string like ?event=sequence_added&list=automated
-// to the webhook URL Ã¢ÂÂ in which case we use that hint instead.
+//   - stage_changed: Outreach Stage attribute updated on a Person.
+//                    DNC path pauses Apollo activity (where possible),
+//                    Engaged/Meeting Booked writes status, Escalated
+//                    is a no-op (the "Needs Human Touch" view catches it).
 //
-// PAYLOAD SHAPES (approximate; verify against actual Attio webhook output
-// during Phase 3 testing Ã¢ÂÂ print req.body and adjust the parsers below):
+//   - outbox_added:  Person added to the Attio "Apollo Search Outbox"
+//                    list. Bridge upserts the contact in Apollo so
+//                    enrichment works for Rebecca's rare Apollo searches.
 //
-// "Record added to list" payloads include the list name and the parent
-// person record. "Attribute updated" payloads include old/new values and
-// the person record.
+// Routing: prefer ?event= hint in the webhook URL, fall back to sniffing
+// list name or attribute slug in the payload.
+//
+// COLD SEQUENCE ENROLLMENT IS NOT HANDLED BY THIS BRIDGE. Jack runs all
+// cold outbound directly in Apollo via the Flywheel email generator.
 // ====================================================================
 
 const { ok, bad, fail, verifySecret } = require('../lib/respond');
@@ -31,7 +29,7 @@ const attio = require('../lib/attio');
 const apollo = require('../lib/apollo');
 const { alert } = require('../lib/notify');
 const {
-  SEQUENCE_MAP,
+  APOLLO_DRIP_LIST_ID,
   APOLLO_INBOX_LIST_ID,
   ENABLE_REDUNDANT_APOLLO_REMOVAL,
 } = require('../config');
@@ -58,8 +56,8 @@ module.exports = async (req, res) => {
 
     let result;
     switch (event) {
-      case 'sequence_added':
-        result = await handleSequenceAdded(body);
+      case 'drip_added':
+        result = await handleDripAdded(body);
         break;
       case 'stage_changed':
         result = await handleStageChanged(body);
@@ -80,7 +78,7 @@ module.exports = async (req, res) => {
 };
 
 // --------------------------------------------------------------------
-// Event detection Ã¢ÂÂ fallback when no ?event= hint is provided
+// Event detection — fallback when no ?event= hint is provided
 // --------------------------------------------------------------------
 
 function detectEvent(body) {
@@ -98,7 +96,7 @@ function detectEvent(body) {
     body?.data?.attribute?.api_slug ||
     null;
 
-  if (listName && /^Sequence:/i.test(listName)) return 'sequence_added';
+  if (listName && /drip/i.test(listName)) return 'drip_added';
   if (listName && /Apollo Search Outbox/i.test(listName)) return 'outbox_added';
   if (attrSlug && /outreach.?stage/i.test(attrSlug)) return 'stage_changed';
   return null;
@@ -174,20 +172,16 @@ function extractListName(body) {
 // Handlers
 // --------------------------------------------------------------------
 
-async function handleSequenceAdded(body) {
+async function handleDripAdded(body) {
   const person = extractPerson(body);
-  const listName = extractListName(body);
-  if (!person || !person.email) throw new Error('sequence_added: missing person email');
-  if (!listName) throw new Error('sequence_added: missing list name');
+  if (!person || !person.email) throw new Error('drip_added: missing person email');
 
-  // Strip "Sequence: " prefix to look up in SEQUENCE_MAP
-  const sequenceName = listName.replace(/^Sequence:\s*/i, '').trim();
-  const apolloSequenceId = SEQUENCE_MAP[sequenceName];
-  if (!apolloSequenceId || apolloSequenceId.startsWith('REPLACE_')) {
-    throw new Error(`No Apollo sequence ID mapped for list: "${sequenceName}". Update config.js.`);
+  const apolloDripListId = require('../config').APOLLO_DRIP_LIST_ID;
+  if (!apolloDripListId || apolloDripListId.startsWith('REPLACE_')) {
+    throw new Error('APOLLO_DRIP_LIST_ID not configured in config.js');
   }
 
-  // 1. Upsert in Apollo
+  // 1. Upsert the contact in Apollo
   const { id: apolloContactId, created } = await apollo.upsertContactByEmail({
     email: person.email,
     firstName: person.firstName,
@@ -197,21 +191,19 @@ async function handleSequenceAdded(body) {
     linkedinUrl: person.linkedinUrl,
   });
 
-  // 2. Enroll in sequence
-  await apollo.addContactToSequence({
-    contactId: apolloContactId,
-    sequenceId: apolloSequenceId,
-  });
+  // 2. Add to the Apollo Bridge Drip list. An Apollo workflow watches
+  //    this list and enrolls the contact in the drip sequence.
+  await apollo.addContactToList(apolloContactId, apolloDripListId);
 
-  // 3. Write back to Attio
+  // 3. Write back to Attio — record the Apollo Contact ID for future
+  //    lookups, and flip sequence status so we know they're in drip.
   await attio.setEngagement(person.id, {
-    outreachStage: 'In Sequence',
-    apolloSequenceStatus: 'Active',
     apolloContactId,
-    assignedSequence: sequenceName,
+    apolloSequenceStatus: 'Active',
+    assignedSequence: 'Drip Re-engagement',
   });
 
-  return { apolloContactId, created, sequenceName, apolloSequenceId };
+  return { apolloContactId, created, apolloDripListId };
 }
 
 async function handleStageChanged(body) {
@@ -228,9 +220,9 @@ async function handleStageChanged(body) {
 
   if (!newStage) throw new Error('stage_changed: could not determine new stage');
 
-  console.log(`[stage_changed] ${person.email} Ã¢ÂÂ ${newStage}`);
+  console.log(`[stage_changed] ${person.email} — ${newStage}`);
 
-  // Find the Apollo contact ID Ã¢ÂÂ prefer the one stored on the Attio record
+  // Find the Apollo contact ID — prefer the one stored on the Attio record
   const apolloContactId = await getApolloContactIdForPerson(person);
 
   switch (newStage) {
@@ -257,7 +249,7 @@ async function handleStageChanged(body) {
       return { action: 'paused_sequence', apolloContactId };
     }
     case 'Escalated': {
-      // Just flag Ã¢ÂÂ the "Needs Human Touch" view filters on this stage,
+      // Just flag — the "Needs Human Touch" view filters on this stage,
       // so Rebecca will see them. No Apollo action needed beyond that.
       return { action: 'noted', apolloContactId };
     }
@@ -287,7 +279,7 @@ async function handleOutboxAdded(body) {
   // Optional: clear them from the inbox_from_rebecca list now that they're
   // in Attio. This keeps the outbox empty as designed.
   // Skipped here because the outbox-added flow originates in Attio, not
-  // Apollo. The reverse direction (Apollo outbox Ã¢ÂÂ Attio creation) belongs
+  // Apollo. The reverse direction (Apollo outbox — Attio creation) belongs
   // in a separate scheduled poller if you decide to support it.
 
   return { apolloContactId, created };

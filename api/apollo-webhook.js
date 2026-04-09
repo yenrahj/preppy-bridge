@@ -1,23 +1,26 @@
 // ====================================================================
 // api/apollo-webhook.js
 //
-// Single endpoint handling all 5 Apollo workflow webhook payloads:
+// Handles all Apollo workflow webhook payloads:
 //
-//   1. "Preppy Flywheel: Email Replied → Webhook"
-//   2. "Preppy Flywheel: Email Bounced → Webhook"
-//   3. "Preppy Flywheel: Contact Finished Sequence → Webhook"
-//   4. "Preppy Flywheel: Email Opened → Webhook"
-//   5. "Preppy Flywheel: Meeting Booked → Webhook"
+//   1. "Preppy Flywheel: Email Replied → Webhook"      (event=replied)
+//   2. "Preppy Flywheel: Email Bounced → Webhook"      (event=bounced)
+//   3. "Preppy Flywheel: Contact Finished Sequence"    (event=finished)
+//   4. "Preppy Flywheel: Email Opened → Webhook"       (event=opened)
+//   5. "Preppy Flywheel: Email Clicked → Webhook"      (event=clicked)
+//   6. "Preppy Flywheel: Meeting Booked → Webhook"     (event=meeting)
 //
-// Routing strategy: same as the Attio handler — prefer a ?event= hint
-// in the webhook URL, fall back to sniffing the payload shape. When you
-// configure each Apollo workflow's webhook URL, add the hint:
+// Engagement threshold logic:
+// - Clicks flag immediately (Flagged for Review = true).
+// - Opens are counted on a rolling N-day window; once the count reaches
+//   ENGAGEMENT_OPEN_THRESHOLD, Flagged for Review = true.
+// - Replies/meetings flip Outreach Stage to Engaged/Meeting Booked.
+// - Bounces set Outreach Stage = Do Not Contact.
+// - Flagged contacts are NOT pulled out of their cold sequence; Apollo's
+//   native auto-remove-on-reply handles the most important cutoff.
 //
-//   https://your-bridge.vercel.app/api/apollo-webhook?event=replied&secret=...
-//   https://your-bridge.vercel.app/api/apollo-webhook?event=opened&secret=...
-//   https://your-bridge.vercel.app/api/apollo-webhook?event=bounced&secret=...
-//   https://your-bridge.vercel.app/api/apollo-webhook?event=finished&secret=...
-//   https://your-bridge.vercel.app/api/apollo-webhook?event=meeting&secret=...
+// Routing strategy: prefer ?event= hint in the webhook URL, fall back to
+// sniffing the payload shape.
 // ====================================================================
 
 const { ok, bad, fail, verifySecret } = require('../lib/respond');
@@ -25,9 +28,13 @@ const attio = require('../lib/attio');
 const apollo = require('../lib/apollo');
 const { shouldWriteOpenEvent } = require('../lib/dedupe');
 const { alert } = require('../lib/notify');
-const { ENABLE_REDUNDANT_APOLLO_REMOVAL } = require('../config');
+const {
+  ENABLE_REDUNDANT_APOLLO_REMOVAL,
+  ENGAGEMENT_OPEN_THRESHOLD,
+  ENGAGEMENT_OPEN_WINDOW_DAYS,
+} = require('../config');
 
-const VALID_EVENTS = new Set(['replied', 'opened', 'bounced', 'finished', 'meeting']);
+const VALID_EVENTS = new Set(['replied', 'opened', 'clicked', 'bounced', 'finished', 'meeting']);
 
 module.exports = async (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -44,7 +51,7 @@ module.exports = async (req, res) => {
   const event = (req.query?.event || '').toLowerCase();
   if (!VALID_EVENTS.has(event)) {
     await alert('Apollo webhook missing/invalid ?event= hint', { event, sample: body });
-    return bad(res, `must specify ?event=replied|opened|bounced|finished|meeting`);
+    return bad(res, `must specify ?event=replied|opened|clicked|bounced|finished|meeting`);
   }
 
   try {
@@ -71,9 +78,6 @@ async function dispatch(event, body) {
     ? await attio.findPersonByEmail(ctx.email)
     : null;
   if (!attioPerson) {
-    // Don't blow up — log and move on. The contact may exist in Apollo but
-    // not yet in Attio (e.g., if Rebecca enrolled them via the search outbox
-    // but they haven't synced yet).
     console.warn(`[apollo-webhook:${event}] no Attio person for email ${ctx.email}`);
     return { skipped: 'no_attio_person', email: ctx.email };
   }
@@ -81,7 +85,8 @@ async function dispatch(event, body) {
 
   switch (event) {
     case 'replied':   return handleReplied(attioPersonId, ctx);
-    case 'opened':    return handleOpened(attioPersonId, ctx);
+    case 'opened':    return handleOpened(attioPersonId, ctx, attioPerson);
+    case 'clicked':   return handleClicked(attioPersonId, ctx);
     case 'bounced':   return handleBounced(attioPersonId, ctx);
     case 'finished':  return handleFinished(attioPersonId, ctx);
     case 'meeting':   return handleMeeting(attioPersonId, ctx);
@@ -125,18 +130,66 @@ async function handleReplied(personId, ctx) {
   return { stage: 'Engaged', notePosted: !!ctx.replyBody };
 }
 
-async function handleOpened(personId, ctx) {
-  // Apply dedupe — opens are noisy
+async function handleOpened(personId, ctx, attioPerson) {
+  // Rapid-fire dedupe — Apollo often fires multiple open events from
+  // image preloaders in quick succession. The dedupe window (default 60
+  // min) collapses these so one real visit = one count increment.
   if (ctx.apolloContactId && !shouldWriteOpenEvent(ctx.apolloContactId)) {
     return { skipped: 'deduped' };
   }
-  // Only update last-engagement-date and -type. Do NOT change Outreach Stage.
-  // Open events should NOT trigger Needs Human Touch.
+
+  // Read current counter state from the Attio record.
+  const values = attioPerson?.values || {};
+  const currentCount = Number(values.open_count_7d?.[0]?.value) || 0;
+  const resetAt = values.opens_reset_at?.[0]?.value
+    ? new Date(values.opens_reset_at[0].value)
+    : null;
+  const alreadyFlagged = !!values.flagged_for_review?.[0]?.value;
+
+  // Is the existing window still valid?
+  const now = new Date();
+  const windowMs = ENGAGEMENT_OPEN_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  const windowValid = resetAt && (now.getTime() - resetAt.getTime()) < windowMs;
+
+  let newCount, newResetAt;
+  if (windowValid) {
+    newCount = currentCount + 1;
+    newResetAt = resetAt.toISOString();
+  } else {
+    // Window expired or never started — start fresh.
+    newCount = 1;
+    newResetAt = now.toISOString();
+  }
+
+  // Should we flag? Only if not already flagged (avoid redundant writes)
+  // and we've hit the threshold.
+  const shouldFlag = !alreadyFlagged && newCount >= ENGAGEMENT_OPEN_THRESHOLD;
+
   await attio.setEngagement(personId, {
-    lastEngagementDate: new Date().toISOString(),
+    lastEngagementDate: now.toISOString(),
     lastEngagementType: 'Opened',
+    openCount7d: newCount,
+    opensResetAt: newResetAt,
+    ...(shouldFlag && { flaggedForReview: true }),
   });
-  return { stage: 'unchanged' };
+
+  return {
+    stage: 'unchanged',
+    openCount: newCount,
+    windowStart: newResetAt,
+    flagged: shouldFlag,
+  };
+}
+
+async function handleClicked(personId, ctx) {
+  // Clicks are high-signal. Flag immediately.
+  const now = new Date().toISOString();
+  await attio.setEngagement(personId, {
+    lastEngagementDate: now,
+    lastEngagementType: 'Clicked',
+    flaggedForReview: true,
+  });
+  return { stage: 'unchanged', flagged: true };
 }
 
 async function handleBounced(personId, ctx) {
