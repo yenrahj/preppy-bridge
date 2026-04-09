@@ -20,7 +20,7 @@
 
 // Apollo list ID for the Bridge Drip re-engagement list.
 // Fill in after creating the Apollo list (see Chrome agent brief).
-const APOLLO_DRIP_LIST_ID = 'REPLACE_WITH_APOLLO_DRIP_LIST_ID';
+const APOLLO_DRIP_LIST_ID = '69d7b41ba031ed000d1125e5';
 
 // Apollo list ID for the "Bridge Inbox" search outbox (existing).
 const APOLLO_INBOX_LIST_ID = '69d65c6b00b0d30015c0eafa';
